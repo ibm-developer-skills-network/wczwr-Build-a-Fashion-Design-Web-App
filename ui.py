@@ -20,6 +20,7 @@ import os
 import heapq
 import subprocess
 from io import BytesIO
+import base64
 
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 project_id = "skills-network"
@@ -58,27 +59,21 @@ sample_params = TextChatParameters.get_sample_params()
 params = TextChatParameters(**sample_params)
 
 model_chat = ModelInference(
-    model_id='ibm/granite-3-3-8b-instruct',  #meta-llama/llama-3-3-70b-instruct
+    model_id='ibm/granite-4-h-small',  #meta-llama/llama-4-maverick-17b-128e-instruct-fp8
     credentials=credentials,
     project_id=project_id,
     params=params,
 )
 
-def process_dalle_images(response, filename, image_dir, width, height):
+def process_gpt_images(response, filename, image_dir):
     os.makedirs(image_dir, exist_ok=True)  # ensure the directory exists
 
-    urls = [datum.url for datum in response.data]  # extract URLs
-    image_names = [f"{filename}_{i + 1}.png" for i in range(len(urls))]  # create names
+    images = [base64.b64decode(datum.b64_json) for datum in response.data]  # decode base64 images
+    image_names = [f"{filename}_{i + 1}.png" for i in range(len(images))]  # create names
     filepaths = [os.path.join(image_dir, name) for name in image_names]  # create filepaths
-
-    for url, filepath in zip(urls, filepaths):
-        # download and open image
-        img_data = requests.get(url).content
-        with Image.open(BytesIO(img_data)) as img:
-            # resize and save (overwrite original path)
-            img = img.resize((width, height), Image.LANCZOS)
-            img.save(filepath, format="PNG")
-    
+    for image, filepath in zip(images, filepaths):  # loop through the images
+        with open(filepath, "wb") as image_file:  # open the file
+            image_file.write(image)  # write the image to the file
     return filepaths
 
 def extract_mask_only(masked_image):
@@ -164,18 +159,18 @@ def fashion_design(query, mask_input, image_path):
         # create a base blank mask
         width = chosen_mask.shape[1]
         height = chosen_mask.shape[0]
-        mask = Image.new("RGBA", (width, height), (0, 0, 0, 1))  # create an opaque image mask
+        mask = Image.new("RGBA", (width, height), (0, 0, 0, 255))  # create an opaque image mask
 
         # Convert mask back to pixels to add our mask replacing the third dimension
         pix = np.array(mask)
         pix[:, :, 3] = chosen_mask
 
-        new_mask = Image.fromarray(pix, "RGBA")
+        new_mask = Image.fromarray(pix)
         new_mask.save(f"mask_candidates/mask_option{0}.png")
     else:
         #### CLIPSeg
         # Read as a uint8 tensor [C, H, W] in RGB (forces 3 channels; drops alpha if present)
-        img_tensor = read_image(image_path, mode=ImageReadMode.RGB)
+        img_tensor = read_image(image_path)
 
         # Convert to PIL.Image in RGB
         image_pil = to_pil_image(img_tensor)
@@ -233,12 +228,12 @@ def fashion_design(query, mask_input, image_path):
             pix[:, :, 3] = chosen_mask
 
             # Convert pixels back to an RGBA image and display
-            new_mask = Image.fromarray(pix, "RGBA")
+            new_mask = Image.fromarray(pix)
             new_mask.save(f"mask_candidates/mask_option{i}.png")
 
 
     client = OpenAI(api_key=OPENAI_API_KEY)
-    finalized_urls = []
+    finalized = []
     n = 3
     ERROR_FLAG = False
     print('Editing....')
@@ -246,31 +241,32 @@ def fashion_design(query, mask_input, image_path):
         mask_path = f"mask_candidates/mask_option{i}.png"
         try:
             response = client.images.edit(
-                model='dall-e-2',
+                model='gpt-image-2',
                 image=open(image_path, "rb"),  # from the generation section
                 mask=open(mask_path, "rb"),  # from right above
                 prompt=will_change_to,  # provide a prompt to fill the space
                 n=n,
-                size="512x512",
-                response_format="url",
+                size="1024x1024",
             )
-            edit_filepaths = process_dalle_images(response, f"edits_mask{i}", 'edited_images', width, height)
+            image_paths = process_gpt_images(response, f"edits_mask{i}", 'edited_images')
+            print(image_paths)
 
-            for edit_filepath in edit_filepaths:
-                    finalized_urls.append(edit_filepath)
-        except:
-            ERROR_FLAG = TRUE
+            for edited_path in image_paths:
+                    finalized.append(edited_path)
+        except Exception as e:
+            print(f"API error on mask {i}: {e}") 
+            ERROR_FLAG = True
             break
 
     print('Out....')
-    if len(finalized_urls) == 0:
+    if len(finalized) == 0:
         message = 'Edited, but none of the generated images satisfy your request... Please try again by changing your prompt.'
     elif ERROR_FLAG:
         message = "Don't worry! Please TRY again, some minor issue with the connection..."
     else:
         message = 'Edited Sucessfully! (Please note that the models are imperfect, so the image quality can vary significantly)'
 
-    return finalized_urls, message
+    return finalized, message
 
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
